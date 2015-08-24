@@ -1,0 +1,3 @@
+local pkgdev = require 'pkg-dev'
+
+pkgdev[arg[1]](unpack(arg, 2))
