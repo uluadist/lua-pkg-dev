@@ -2,99 +2,23 @@ local pkgu    = require 'pkg'.util
 local xsys    = require 'xsys'
 local lfs     = require 'lfs'
 local serpent = require 'serpent'
+local time    = require 'time'
 
 -- TODO: Remove dependency on xsys.
 local trim, split = xsys.string.trim, xsys.string.split
 local append = xsys.table.append
 local jos, jarch = jit.os, jit.arch
 
---[=[ CONFIGURATION EXAMPLE of ulua/host/config-dev.lua ------------------------
-
--- On Windows: install.bat /P C:/ste/luarocks /TREE C:/ste/luarockstree /L
-
-local jos, jarch = jit.os, jit.arch
-
-local function D(...)
-  return table.concat({ ... }, '/')
-end
-
-local luarocks_address = 'http://rocks.luarocks.org/'
-
-local update_manifest = false
-
-local os_dir = {
-  Windows = {
-    null         = 'nul',
-    package_zip  = 'where to store zip packages and lua metadata',
-    luarocks     = 'where the intermediary output is stored',
-    luarockstree = 'where luarocks tree is',
-  },
-  Linux = {
-    null         = '/dev/null',
-    package_zip  = 'where to store zip packages and lua metadata',
-    luarocks     = 'where the intermediary output is stored',
-    luarockstree = 'where luarocks tree is',
-    customgcc    = 'where the custom gcc script is (to ensure flags)',
-  },
-  OSX = {
-    null         = '/dev/null',
-    package_zip  = 'where to store zip packages and lua metadata',
-    luarocks     = 'where the intermediary output is stored',
-    luarockstree = 'where luarocks tree is',
-    customgcc    = 'where the custom gcc script is (to ensure flags)',
-  }
-}
-
-local os_cmd = {
-  Windows = {
-    luarocks = 'luarocks executable',
-    dos2unix = 'dos 2 unix EOL conversion executable',
-    zip      = 'zip executable',
-  },
-  Linux = {
-    luarocks = 'luarocks executable',
-    dos2unix = 'dos 2 unix EOL conversion executable',
-    zip      = 'zip executable',
-  },
-  OSX = {
-    luarocks = 'luarocks executable',
-    dos2unix = 'dos 2 unix EOL conversion executable',
-    zip      = 'zip executable',
-  }
-}
-
-local dir = os_dir[jos]
-dir.luarocks_package    = D(dir.luarocks, 'package')
-dir.luarocks_repository = D(dir.luarocks, 'repository')
-dir.luarocks_state      = D(dir.luarocks, 'state')
-dir.luarocks_state_sys  = D(dir.luarocks, 'state', jos, jarch)
-dir.luarockstree_lua    = D(dir.luarockstree, 'share/lua/5.1')
-dir.luarockstree_clua   = D(dir.luarockstree, 'lib/lua/5.1')
-dir.luarockstree_bin    = D(dir.luarockstree, 'bin')
-dir.luarockstree_extra  = D(dir.luarockstree, 'lib/luarocks/rocks')
-
-local cmd = os_cmd[jos]
-cmd.zip = cmd.zip..' -r'
-cmd.luarocks = cmd.luarocks..' --deps-mode=none '
-if dir.customgcc then
-  assert(jos ~= 'Windows')
-  cmd.luarocks = 'PATH='..dir.customgcc..':$PATH '..cmd.luarocks
-end
-
-return {
-  luarocks_address = luarocks_address,
-  update_manifest  = update_manifest,
-  dir              = dir,
-  cmd              = cmd,
-}
-
--------------------------------------------------------------------------- ]=]--
-
 -- TODO: Aggregate multiple luarocks into same package to solve some conflicts.
 -- TODO: Implement external libraries handling.
--- TODO: Refactor: rock.name, rock.version.
--- TODO: Refactor: pass around save_error, save_error_sys.
--- TODO: File locking mechanism for concurrent operations.
+-- TODO: Implement proper semantic versioning.
+-- TODO: Refactor: 
+-- TODO: + rock.name, rock.version.
+-- TODO: + pass around save_error, save_error_sys, save_pass.
+-- TODO: Are all these utilities useful in general (xsys? use pl instead?) ?
+
+-- TODO: URGENT: fix latest changes!
+-- TODO: URGENT: implement algorithm such that pass is alway present for all 3 oses (see alnbox)
 
 -- Create a valid path name:
 local function D(...)
@@ -155,8 +79,9 @@ local function file_exist(filename)
   return f ~= nil
 end
 
-local function file_read(filename)
-  local f = assert(io.open(filename, 'rb'))
+local function file_read(filename, opt)
+  opt = opt or 'rb'
+  local f = assert(io.open(filename, opt))
   local s = f:read('*a')
   assert(f:close())
   return s
@@ -184,20 +109,17 @@ local function serialize(t)
   return 'return '..serpent.block(t, { comment = false })
 end
 
+-- TODO: Add example file.
 local config_filename = D(os.getenv('LUA_ROOT'), 'host', 'config-dev.lua')
 local config = deserialize(file_read(config_filename))
 local luarocks_address = config.luarocks_address
-local update_manifest  = config.update_manifest
 local dir              = config.dir
 local cmd              = config.cmd
+local show_new_only    = config.show_new_only
 
 local function execute(command, fstdout, fstderr)
   local toexecute = command..' > '..fstdout..' 2> '..fstderr
   return os.execute(toexecute)
-end
-
-local function file_to_lines(filename)
-  return split(file_read(filename), '\n')
 end
 
 local function to_unix_eol(paths)
@@ -307,11 +229,11 @@ local function id_logger(kind, name, version)
 end
 
 local function has_error(kind, targetrockname, targetrockversion)
-  for _,rocknames in pairs(kind) do
+  for id,rocknames in pairs(kind) do
     for rockname,rockversions in pairs(rocknames) do
-      for rockversion,_ in pairs(rockversions) do
-        if rockname == targetrockname and rockversion == targetrockversion then 
-          return true
+      for rockversion,info in pairs(rockversions) do
+        if rockname == targetrockname and (rockversion == targetrockversion or rockversion..'-0' == targetrockversion) then 
+          return id, info
         end
       end
     end     
@@ -343,7 +265,7 @@ end
 -- Rock and upkg versions only differ in the release number.
 
 -- TODO: Change
-local PKG_VER = 2
+local PKG_VER = 3
 local PKG_MUL = 100
 
 assert(PKG_VER <= PKG_MUL - 1)
@@ -369,6 +291,7 @@ local function to_rock_version(rockname, upkgversion)
   local pre_release, release = unpack(split(upkgversion, '-'))
   return pre_release..'-'..rock_release(rockname, pre_release, release)
 end
+
 --------------------------------------------------------------------------------
 local function download_rockspec(rockname, rockversion)
   local rockspec_filename = rockname..'-'..rockversion..'.rockspec'
@@ -432,6 +355,7 @@ local luarocksos_to_luaos = {
   macosx       = 'OSX',
   linux        = 'Linux',
   unix         = 'OSX,Linux',
+  bsd          = 'OSX',
 }
 
 local function is_supported_os(rockspec)
@@ -543,6 +467,13 @@ local function description_field(description, field, rockname)
   end
 end
 
+local function save_pass(rockname, rockversion, status)
+  local upkgversion = to_upkg_version(rockname, rockversion)
+  local save = logger(rock_pass, rockname, upkgversion)
+  save(status, jos, jarch)
+  return status
+end
+
 local function upkg_repo_valid(manifest_repository)
   local all_valid_versions = upkg_repo_all_valid_versions(manifest_repository)
   local valid = { }
@@ -551,46 +482,54 @@ local function upkg_repo_valid(manifest_repository)
       local save_error     = id_logger(rock_error,     rockname, rockversion)
       local save_error_sys = id_logger(rock_error_sys, rockname, rockversion)
 
-      local ok, err = is_valid_version(rockversion)
+      local ok = is_valid_version(rockversion)
       if not ok then
-        save_error('not_valid_version_format', err) 
+        save_error('not_valid_version_format', rockversion) 
+        save_pass(rockname, rockversion, false)
         break 
       end
 
+      local err
       ok, err =  download_rockspec(rockname, rockversion)
       if not ok then
          save_error('rock_download_error', err) 
+         save_pass(rockname, rockversion, false)
          break
       end
 
       ok, err = load_downloaded_rockspec(rockname, rockversion)
       if not ok then
         save_error('rock_loadstring_error', err) 
+        save_pass(rockname, rockversion, false)
         break
       end
       local rockspec = ok
 
       ok, err = is_supported_os(rockspec)
-      if not ok then 
+      if not ok then
         save_error_sys('unsupported_os', err) 
+        save_pass(rockname, rockversion, false)
         break
       end
 
       ok, err = is_supported_external_libraries(rockspec)
       if not ok then
         save_error('unsupported_external_library', err) 
+        save_pass(rockname, rockversion, false)
         break
       end
 
       ok, err = is_supported_lua(rockspec)
       if not ok then
         save_error('unsupported_lua_version', err) 
+        save_pass(rockname, rockversion, false)
         break
       end
 
       ok, err = is_valid_version_dependencies(rockspec)
       if not ok then
         save_error('not_valid_version_format_of_dependency', err)
+        save_pass(rockname, rockversion, false)
         break
       end
 
@@ -599,10 +538,12 @@ local function upkg_repo_valid(manifest_repository)
       local description = rockspec.description
       -- To get actual __meta.lua it is still necessary to modify 'require' to 
       -- account for rockname -> { modules } and to add intra-dependencies 
-      -- (same reason).
+      -- (same reason); it is also necessary to set a version to the upkgversion
+      -- , to remove rockspec and to add name.
       local info = {
         version     = rockversion,
         require     = dependencies,
+        -- These are not going to be modified:
         description = description_field(description, 'summary',  rockname),
         license     = description_field(description, 'license'),
         homepage    = description_field(description, 'homepage'),
@@ -615,13 +556,7 @@ end
 
 local function init_manifest()
   local manifest_path = D(dir.luarocks_repository, 'manifest.lua')
-  local manifest_code
-  if update_manifest then
-    manifest_code = pkgu.download(luarocks_address, 'manifest')
-    file_write(manifest_path, manifest_code)
-  else
-    manifest_code = file_read(manifest_path)
-  end
+  local manifest_code = file_read(manifest_path) -- Saved without byte opt.
   local manifest = load_config(manifest_code)
   return manifest
 end
@@ -640,8 +575,8 @@ local function install_rock(rockname, rockversion)
   local errorcode = execute(luarockscmd, logstdout, logstderr)
   if errorcode ~= 0 then -- TODO: Check ok to do binary in windows for this.
     local msg = { 
-      stdout = file_to_lines(logstdout), 
-      stderr = file_to_lines(logstderr), 
+      stdout = rockname..'~'..rockversion..'_out.txt', 
+      stderr = rockname..'~'..rockversion..'_err.txt', 
     }
     local save_error_sys = id_logger(rock_error_sys, rockname, rockversion)
     save_error_sys('luarocks_install_error', msg)
@@ -660,7 +595,7 @@ local function changed_paths(directory, f, ...)
   return (pathdiff(dir_before, dir_after))
 end
 
------------
+------------
 local function content_if_find(path, tomatch)
   local _, last = path:find(tomatch, 1, true) -- Plain matching.
   return last and path:sub(last + 2)
@@ -794,8 +729,9 @@ local function handle(modules, unmatched, installed_paths, handler,
         local to = D(module_dir(rockname, rockversion, modulename), content) 
         modules[modulename] = modules[modulename] or { }
         if modules[modulename][to] then
-          local save_error = id_logger(rock_error_sys, rockname, rockversion)
-          save_error('destination_already_set', to)
+          local save_error_sys = id_logger(rock_error_sys, rockname, 
+            rockversion)
+          save_error_sys('destination_already_set', to)
           return nil, 'destination already set '..to
         end
         modules[modulename][to] = path
@@ -829,8 +765,8 @@ local function modules_links(installed_paths, rockname, rockversion)
   remove_expected(unmatched)
   local unmatched_array = keys_to_array(unmatched)
   if #unmatched_array > 0 then
-    local save_error = id_logger(rock_error_sys, rockname, rockversion)
-    save_error('unexpected_files', unmatched_array)
+    local save_error_sys = id_logger(rock_error_sys, rockname, rockversion)
+    save_error_sys('unexpected_files', unmatched_array)
     local unmatched_text = table.concat(unmatched_array, '\n')
     return nil, 'unexpected files: '..unmatched_text
   end
@@ -921,6 +857,7 @@ local function get_meta(info, modules, rockname, rockversion, repo)
   local meta = { }
   for modulename in pairs(modules) do
     meta[modulename] = copy_table(meta_common)
+    meta[modulename].name = modulename
     fix_require(meta[modulename], repo)
   end
   for modulename, modulemeta in pairs(meta) do
@@ -938,53 +875,49 @@ local function check_has_files(paths, rockname, rockversion)
   return true
 end
 
-local function status_printer(rockname, rockversion)
+local function status_printer(rockname, rockversion, level)
   assert(rockname and rockversion)
-  return function(status, message)
+  return function(status, message, exclude)
     assert(status)
-    local fixed_status = fixed_width(status, 8)
-    local fixed_name_version = fixed_width(rockname..'~'..rockversion, 32)
-    io.write(fixed_status, ' : ', fixed_name_version)
-    if message then
-      io.write(' : ', message)
+    if not exclude then
+      local fixed_status = fixed_width((' '):rep(level)..status, 10)
+      local fixed_name_version = fixed_width(rockname..'~'..rockversion, 32)
+      io.write(fixed_status, ' : ', fixed_name_version)
+      if message then
+        io.write(' : ', message)
+      end
+      io.write('\n')
     end
-    io.write('\n')
   end
 end
 
-local function save_pass(rockname, rockversion, status)
-  local upkgversion = to_upkg_version(rockname, rockversion)
-  local save = logger(rock_pass, rockname, upkgversion)
-  save(status, jos, jarch)
-  return status
-end
-
-local function install(repo, rockname, rockversion)
-  local print_status = status_printer(rockname, rockversion or '<latest>')
-  print_status('START')
+local function install(repo, rockname, rockversion, level)
+  level = level or 0
+  local print_status = status_printer(rockname, rockversion or '<latest>', 
+    level)
 
   local als_install_unstable = not rockversion
 
   local vinfo = repo[rockname]
   if not vinfo then
-    print_status('FAIL', 'unavailable rock')
+    print_status('FAIL', 'unavailable rock', show_new_only) 
     return nil
   end
 
   local info = pkgu.infobest(repo, rockname, rockversion)
   if not info then
-    print_status('FAIL', 'unavailable rock version')
+    print_status('FAIL', 'unavailable rock version', show_new_only)
     return nil
   end
 
   rockversion = rockversion or info.version
-  print_status = status_printer(rockname, rockversion)
+  print_status = status_printer(rockname, rockversion,  level)
 
   -- Has to be before rock_pass check because subsequent OS-specific build
   -- can set an error in rock_error due to filename differences.
   if has_error(rock_error,     rockname, rockversion) or
      has_error(rock_error_sys, rockname, rockversion) then
-     print_status('FAIL', 'previous failure')
+     print_status('FAIL', 'previous failure', show_new_only)
      -- Necessary to update this as runs on other OS might have set failure 
      -- in rock_error:
      return save_pass(rockname, rockversion, false)
@@ -994,15 +927,15 @@ local function install(repo, rockname, rockversion)
 
   local upkversion = to_upkg_version(rockname, rockversion)
   if getvarg(rock_pass, rockname, upkversion, jos, jarch) then
-    print_status('PASS', 'already installed')
+    print_status('PASS', 'already installed', show_new_only)
   
   else -- Perform install.
 
+    -- Iterate over dependencies first:
     for dep_rockname, dep_rockversion in pairs(info.require) do
       -- TODO: We need to add support for packages not in luarocks.
       if dep_rockname ~= 'luajit' then
         -- Dependent rock must fail as well, we cannot determine 'require'.
-        print_status('REQUIRE')
         local dep_info = pkgu.infobest(repo, dep_rockname, 
           dep_rockversion)
         if not dep_info then
@@ -1013,10 +946,10 @@ local function install(repo, rockname, rockversion)
             rock_version = dep_rockversion,
           }
           save_exclude('dependency_unavailable', dependency)
-          print_status('FAIL', 'dependency not available')
+          print_status('FAIL', 'dependency not available', show_new_only)
           return save_pass(rockname, rockversion, false)
         end
-        local ok = install(repo, dep_rockname, dep_info.version)
+        local ok = install(repo, dep_rockname, dep_info.version, level + 1)
         if not ok then
           local save_exclude = id_logger(rock_exclude_sys, rockname, 
             rockversion)
@@ -1025,12 +958,13 @@ local function install(repo, rockname, rockversion)
             rock_version = dep_info.version,
           }
           save_exclude('dependency_failure', dependency)
-          print_status('FAIL', 'failure in dependency')
+          print_status('FAIL', 'failure in dependency', show_new_only)
           return save_pass(rockname, rockversion, false)
         end
       end
     end
 
+    -- Actual Luarock install:
     pkgu.emptydir(dir.luarockstree)
     local installed_paths, stderr = changed_paths(dir.luarockstree, 
       install_rock, rockname, rockversion)
@@ -1094,12 +1028,15 @@ local function modules_of_rockname(rockname, upkgversion)
 end
 
 local function all_os_pass(oses)
-  return getvarg(oses, 'Windows', jarch)
-     and getvarg(oses, 'Linux',   jarch)
-     and getvarg(oses, 'OSX',     jarch)
+  return getvarg(oses, 'Windows', 'x86')
+     and getvarg(oses, 'Linux',   'x86')
+     and getvarg(oses, 'OSX',     'x86')
+     and getvarg(oses, 'Windows', 'x64')
+     and getvarg(oses, 'Linux',   'x64')
+     and getvarg(oses, 'OSX',     'x64')
 end
 
-local function update_package_zip()
+local function rock_finalize()
   for rockname, upkgversions in pairs(rock_pass) do
     for upkgversion, os_arch_pass in pairs(upkgversions) do
       if all_os_pass(os_arch_pass) then
@@ -1124,20 +1061,34 @@ local function update_package_zip()
 end
 
 -- TODO: Allow working with more than 1 simple non-nested directory.
-local function finalize(name)
-  if name:sub(-1, -1) == '/' then
-    name = name:sub(1, -2)
-  end
-  assert(not name:find('/'))
-  local meta_content = file_read(D(name, '__meta.lua'))
+local function finalize(path)
+  local meta_content = file_read(D(path, '__meta.lua'))
   local meta = deserialize(meta_content)
-  local dir_version = meta.version
-  local basename = name..'~'..dir_version
+  local version = assert(meta.version)
+  local name = assert(meta.name)
+  assert(meta.require)
+  assert(meta.homepage)
+  assert(meta.description)
+  local basename = name..'~'..version
   local zip_file  = D(dir.package_zip, basename..'.zip')
   local lua_file = D(dir.package_zip, basename..'.lua')
-  assert(not file_exist(zip_file))
-  assert(not file_exist(lua_file))
-  local zipcmd = cmd.zip..' '..zip_file..' '..name..' -x "*/\\.*"'
+  if file_exist(zip_file) or file_exist(lua_file) then
+    print('Package already present, overwrite?')
+    local ok = pkgu.confirm()
+    if not ok then
+      return
+    end
+  end
+  local tmp_dir = D(os.getenv('LUA_ROOT'), 'host', 'tmp')
+  local tmp_name_dir = D(tmp_dir, name)
+  pkgu.emptydir(tmp_name_dir)
+  lfs.rmdir(tmp_name_dir)
+  lfs.mkdir(tmp_name_dir)
+  local current_dir = lfs.currentdir()
+  local zipcmd =' cp -a '..path..' '..tmp_name_dir
+              ..' && cd '..tmp_dir 
+              ..' && '..cmd.zip..' '..zip_file..' '..name..' -x "*/\\.*"'
+              ..' && cd '..current_dir
   assert(execute(zipcmd, dir.null, dir.null) == 0)
   file_write(lua_file, meta_content)
 end
@@ -1156,27 +1107,222 @@ local function update_repo()
   file_write(D(dir.package_zip, '__repo.lua'), serialize(repo))
 end
 
+-- Strings: name, link, name, description, versions.
+local modules_body_fmt = [[
+        <tr id ="%s"><td><a href="%s">%s</a></td><td>%s</td><td>%s</td></tr>
+]]
+
+local function update_website_luarocks_packages()
+  local repo = deserialize(file_read(D(dir.package_zip, '__repo.lua')))
+  local names = keys_to_array(repo)
+  table.sort(names, function(x, y) return x:lower() < y:lower() end)
+  local modules = { }
+  for i=1,#names do
+    local name = names[i]
+    local vinfo = repo[name]
+    local versions = { }
+    for j=1,#vinfo do 
+      versions[j] = vinfo[j].version 
+    end
+    versions = table.concat(versions, '<br/>')
+    local description = vinfo[1].description
+    local homepage = vinfo[1].homepage
+    modules[i] = modules_body_fmt:format(name, homepage, name, description, 
+      versions) 
+  end
+  modules = table.concat(modules)
+  local template = file_read(D(dir.website, 'luarocks_packages_template.html'))
+  template = template:gsub('%${modules}', modules)
+  file_write(D(dir.website, 'luarocks_packages.html'), template)
+end
+
+-- Strings: module, module, version, os, arch, pass, info.
+local autobuild_body_fmt = [[
+        <tr id="%s"><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>
+]]
+
+local function format_pass(s)
+  if s then 
+    return '<span style="color:green">yes</span>'
+  else
+    return '<span style="color:red">no</span>'
+  end
+end
+
+local format_failure_dispatch = setmetatable({
+  unsupported_external_library = function()
+    return 'depends on external library', true
+  end,
+  not_valid_version_format = function(info)
+    return 'rock version "'..info..'" is not <a href="http://semver.org/">semver</a> compatible'
+  end,
+  not_valid_version_format_of_dependency = function(info)
+    return 'dependency version in "'..info..'" is not <a href="http://semver.org/">semver</a> compatible'
+  end,
+  module_conflict = function(info)
+    return 'contending module "'..info.module_name..'" with "'..info.rock_name..'~'..info.rock_version..'"'
+  end,
+  file_os_conflict = function(_)
+    return 'different .lua file for different OS'
+  end,
+  rock_download_error = function(_)
+    return 'failed downloading rockspec'
+  end,
+  luarocks_install_error = function(_, rockname, rockversion, tos, tarch)
+    local logaddr = D('luarocksorg', 'state', tos, tarch, 'log', rockname..'~'..rockversion)
+    local logstdout = logaddr..'_out.txt'
+    local logstderr = logaddr..'_err.txt' 
+    return 'rock install failed, see: <a href="'..logstderr..'">stderr</a> and <a href="'..logstdout..'">stdout</a>'
+  end,
+  dependency_failure = function(info)
+    return 'depends on failed '..info.rock_name..'~'..info.rock_version, true
+  end,
+  dependency_unavailable = function(info)
+    return 'depends on unavailable '..info.rock_name..'~'..(info.rock_version or 'any'), true
+  end,
+  unsupported_os = function(_)
+    return 'unsupported OS', true
+  end,
+  destination_already_set = function(_)
+    return 'conflict between modulname.lua and modulename/init.lua'
+  end,
+  unexpected_files = function(_)
+    return 'rock installs unexpected files'
+  end,
+}, { __index = function(_, k) error('NYI: '..k) end })
+
+local function format_failure(rockname, upkgversion, erro, syserro, sysexcl, tos, tarch)
+  local rockversion = to_rock_version(rockname, upkgversion)
+  local id, info = has_error(erro, rockname, rockversion)
+  if id then
+    return format_failure_dispatch[id](info)
+  end
+  id, info = has_error(syserro, rockname, rockversion)
+  if id then
+    return format_failure_dispatch[id](info, rockname, rockversion, tos, tarch)
+  end
+  id, info = has_error(sysexcl, rockname, rockversion)
+  if id then
+    return format_failure_dispatch[id](info)
+  end  
+  error('cannot find error for '..rockname..'~'..rockversion..' '..tos..' '..tarch)
+end
+
+local function format_success(rockname, upkgversion, tos, tarch)
+  local rockversion = to_rock_version(rockname, upkgversion)
+  local logaddr = D('luarocksorg', 'state', tos, tarch, 'log', rockname..'~'..rockversion)
+  local logstdout = logaddr..'_out.txt'
+  local logstderr = logaddr..'_err.txt' 
+  return 'rock install passed, see: <a href="'..logstderr..'">stderr</a> and <a href="'..logstdout..'">stdout</a>'
+end
+
+-- TODO: Consider both x86 and x64.
+local function update_website_build()
+  local pass = deserialize(file_read(D(dir.luarocks_state, 'pass.lua')))
+  local erro = deserialize(file_read(D(dir.luarocks_state, 'error.lua')))
+  local syserro, sysexcl = { }, { }
+  for _,tos in ipairs{ 'Windows', 'OSX', 'Linux' } do
+    syserro[tos] = { 
+      x86 = deserialize(file_read(D(dir.luarocks_state, tos, 'x86', 'error_sys.lua'))),
+      x64 = deserialize(file_read(D(dir.luarocks_state, tos, 'x64', 'error_sys.lua')))
+    }
+    sysexcl[tos] = { 
+      x86 = deserialize(file_read(D(dir.luarocks_state, tos, 'x86', 'exclude_sys.lua'))),
+      x64 = deserialize(file_read(D(dir.luarocks_state, tos, 'x64', 'exclude_sys.lua')))
+    }
+  end
+  local names = keys_to_array(pass)
+  table.sort(names, function(x, y) return x:lower() < y:lower() end)
+  local state = { }
+  for i=1,#names do
+    local name = names[i]
+    for version, oses in pairs(pass[name]) do 
+      for tos,tarches in pairs(oses) do
+        for tarch in pairs(tarches) do
+          local tpass = format_pass(oses[tos][tarch])
+          local info
+          if not oses[tos][tarch] then -- Failure.
+            local exclude
+            info, exclude = format_failure(name, version, erro, syserro[tos][tarch], sysexcl[tos][tarch], tos, tarch)
+            if exclude then
+              tpass = '<span style="color:orange">excluded</span>'
+            end
+          else
+            info = format_success(name, version, tos, tarch)
+          end
+          state[#state+1] = autobuild_body_fmt:format(name, name, version, tos, tarch, tpass, info)
+        end
+      end
+    end
+  end
+  state = table.concat(state)
+  local template = file_read(D(dir.website, 'luarocks_autobuild_template.html'))
+  template = template:gsub('%${state}', state)
+  file_write(D(dir.website, 'luarocks_autobuild.html'), template)
+end
+
+local function totime(path, what)
+  local pathattr = lfs.attributes(path)
+  local timestamp = assert(pathattr[what])
+  local datestamp = os.date('*t', timestamp)
+  return time.date(datestamp.year, datestamp.month, datestamp.day)
+end
+
+-- Strings: date, link, name, description, versions.
+local updates_body_fmt = [[
+        <tr><td>%s</td><td><a href="%s">%s</a></td><td>%s</td><td>%s</td></tr>
+]]
+
+local function update_website_index()
+  local packages = { }
+  for file in lfs.dir(dir.package_zip) do
+    if file:sub(-4, -1) == '.lua' and file:sub(1, 2) ~= '__' then
+      local info = deserialize(file_read(D(dir.package_zip, file)))
+      local name, _ = unpack(split(file:sub(1, -5), '~'))
+      info.name = info.name or name -- Old packages do not have the name field!
+      local path = D(dir.package_zip, file)
+      local filetime = totime(path, 'modification')
+      packages[#packages + 1] = { filetime, info }
+    end
+  end
+  table.sort(packages, function(x, y) return x[1] > y[1] end)
+  local updates = { }
+  for i=1,10 do
+    local date = tostring(packages[i][1]):sub(1, 10)
+    local info = packages[i][2]
+    updates[i] = updates_body_fmt:format(date, info.homepage, info.name, info.description, info.version)
+  end
+  updates = table.concat(updates)
+  local template = file_read(D(dir.website, 'index.template.html'))
+  template = template:gsub('%${updates}', updates)
+  file_write(D(dir.website, 'index.html'), template)
+end
+
 return {
-  rock_list = function()
+  ['rock-list'] = function()
     local manifest = init_manifest()
     local rocknames = keys_to_array(manifest.repo)
     table.sort(rocknames)
     print(table.concat(rocknames, '\n'))
   end,
-  rock_install = function(name, version)
+  ['rock-install'] = function(name, version)
     local manifest_repo = repo_from_manifest()
     install(manifest_repo, name, version)
   end,
-  rock_install_all = function()
+  ['rock-install-all'] = function()
     local manifest_repo = repo_from_manifest()
     local rocknames = keys_to_array(manifest_repo)
     table.sort(rocknames)
     for i=1,#rocknames do   
       install(manifest_repo, rocknames[i])
-      io.write('\n')
     end
   end,
-  rock_finalize = update_package_zip,
-  finalize      = finalize,
-  update_repo   = update_repo,
+  ['rock-finalize'] = rock_finalize,
+  ['finalize']      = finalize,
+  ['update-repo']   = update_repo,
+  ['update-website'] = function()
+    update_website_luarocks_packages()
+    update_website_build()
+    update_website_index()
+  end,
 }
