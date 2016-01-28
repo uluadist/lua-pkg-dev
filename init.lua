@@ -3,6 +3,7 @@ local xsys    = require 'xsys'
 local lfs     = require 'lfs'
 local serpent = require 'serpent'
 local time    = require 'time'
+local md5     = require 'md5'
 
 -- TODO: Remove dependency on xsys.
 local trim, split = xsys.string.trim, xsys.string.split
@@ -16,9 +17,6 @@ local jos, jarch = jit.os, jit.arch
 -- TODO: + rock.name, rock.version.
 -- TODO: + pass around save_error, save_error_sys, save_pass.
 -- TODO: Are all these utilities useful in general (xsys? use pl instead?) ?
-
--- TODO: URGENT: fix latest changes!
--- TODO: URGENT: implement algorithm such that pass is alway present for all 3 oses (see alnbox)
 
 -- Create a valid path name:
 local function D(...)
@@ -192,10 +190,13 @@ local function persistent(filename)
 end
 
 -- rockname -> upkgversion -> os -> arch -> true/false:
-local rock_pass = persistent(D(dir.luarocks_state, 'pass.lua'))
+local rock_pass        = persistent(D(dir.luarocks_state, 'pass.lua'))
 
 -- rockname -> rockversion -> modules -> true:
 local rock_modules     = persistent(D(dir.luarocks_state, 'modules.lua'))
+
+-- TODO
+local module_bundles   = persistent(D(dir.luarocks_state, 'bundles.lua'))
 
 -- excludeid -> rockname -> rockversion -> { rock_ name, rock_ version }:
 local rock_exclude_sys = persistent(D(dir.luarocks_state_sys, 
@@ -567,6 +568,64 @@ local function repo_from_manifest()
 end
 
 --------------------------------------------------------------------------------
+local function is_in_boundle(modules, rockname)
+  local amodules = keys_to_array(modules)
+  local name = amodules[1]
+  if #amodules == 1 and module_bundles[name] then
+    for _,p in ipairs(module_bundles[name].pattern) do
+      if rockname:find(p) then
+        print('BUNDLE', rockname, name)
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function bundle_hash(metas)
+  local hash = { }
+  for _,m in ipairs(metas) do
+    hash[#hash + 1] = m.name
+    hash[#hash + 1] = m.version
+  end
+  return md5.sumhexa(table.concat(hash))
+end
+
+local function bundle_require(metas)
+  local require = { }
+  for _,m in ipairs(metas) do
+    for name,version in pairs(m.require) do
+      if require[name] then
+        assert(require[name] == version) -- Simplistic approach.
+      else
+        require[name] = version
+      end
+    end
+  end
+  return require
+end
+
+local function bundle_license(metas)
+  local license = { }
+  for _,m in ipairs(metas) do
+    license[m.license] = true
+  end
+  return table.concat(keys_to_array(license), ' + ')
+end
+
+local function bundle_description(metas, bundlename)
+  local description = { }
+  for _,m in ipairs(metas) do
+    description[#description + 1] = m.name..'~'..m.version..': '..m.description
+  end
+  return bundlename..'-bundle: '..table.concat(description, ' + ')
+end
+
+local function bundle_copy_parhs(metas)
+
+end
+
+--------------------------------------------------------------------------------
 local function install_rock(rockname, rockversion)
   local luarockscmd = cmd.luarocks..'install '..rockname..' '..rockversion
   local logpath = D(dir.luarocks_state_sys, 'log', rockname..'~'..rockversion)
@@ -691,18 +750,21 @@ local function remove_expected(unmatched)
 end
 
 local function has_module_conflict(modules, rockname, rockversion)
-  for modulename in pairs(modules) do
-    local in_rockname, in_rockversion = module_exist(rock_modules, modulename)
-    if in_rockname and in_rockname ~= rockname then
-      local save_error = id_logger(rock_error, rockname, rockversion)
-      save_error('module_conflict', { 
-        module_name = modulename,
-        rock_name = in_rockname, 
-        rock_version = in_rockversion 
-      })
-      return modulename
+  if not is_in_boundle(modules, rockname) then
+    for modulename in pairs(modules) do
+      local in_rockname, in_rockversion = module_exist(rock_modules, modulename)
+      if in_rockname and in_rockname ~= rockname then
+        local save_error = id_logger(rock_error, rockname, rockversion)
+        save_error('module_conflict', { 
+          module_name = modulename,
+          rock_name = in_rockname, 
+          rock_version = in_rockversion 
+        })
+        return modulename
+      end
     end
   end
+  return false
 end
 
 local function module_dir_upkg(rockname, upkgversion, modulename)
@@ -820,7 +882,7 @@ local function copy_modules_meta(meta, rockname, rockversion)
   end
 end
 
-local function fix_require(modulemeta, repo)
+local function fix_require_rocknames_to_modules(modulemeta, repo)
   local fixed_require = { }
   for dep_name, dep_version in pairs(modulemeta.require) do
     if dep_name ~= 'luajit' and dep_name ~= 'pkg' then
@@ -828,7 +890,9 @@ local function fix_require(modulemeta, repo)
       local target_version = info.version
       local modules = assert(getvarg(rock_modules, dep_name, target_version))
       for dep_modulename in pairs(modules) do
-        fixed_require[dep_modulename] = dep_version
+        if dep_modulename ~= modulemeta.name then -- No bundle self-dependency.
+          fixed_require[dep_modulename] = dep_version
+        end
       end
     else
       fixed_require[dep_name] = dep_version
@@ -858,7 +922,7 @@ local function get_meta(info, modules, rockname, rockversion, repo)
   for modulename in pairs(modules) do
     meta[modulename] = copy_table(meta_common)
     meta[modulename].name = modulename
-    fix_require(meta[modulename], repo)
+    fix_require_rocknames_to_modules(meta[modulename], repo)
   end
   for modulename, modulemeta in pairs(meta) do
     add_intra_dependencies(modulename, modulemeta, meta, upkgversion)
@@ -986,6 +1050,7 @@ local function install(repo, rockname, rockversion, level)
       return save_pass(rockname, rockversion, false)
     end
 
+    -- TODO: Check bundle and pattern and allow if so:
     local module_conflict = has_module_conflict(modules, rockname, rockversion) 
     if module_conflict then
       print_status('FAIL', 'module conflict :'..module_conflict)
@@ -1036,6 +1101,14 @@ local function all_os_pass(oses)
      and getvarg(oses, 'OSX',     'x64')
 end
 
+-- TODO: 2 phases, non-bundles (as of now) and bundles, separately.
+-- bundles:
+-- 1. consider all modules in the bundle, latest version only
+-- 2. compute has based on names and strings
+-- 3. if hash different 
+--   31. create __boundle/rootname/incrversion and copy (handle __, collisions)
+--   32. crate aggregated __meta.lua
+--   33. zip
 local function rock_finalize()
   for rockname, upkgversions in pairs(rock_pass) do
     for upkgversion, os_arch_pass in pairs(upkgversions) do
@@ -1045,14 +1118,15 @@ local function rock_finalize()
         for modulename in pairs(modules) do
           local basename = modulename..'~'..upkgversion
           local zip_file = D(dir.package_zip, basename..'.zip')
-          local lua_fule = D(dir.package_zip, basename..'.lua')
+          local lua_file = D(dir.package_zip, basename..'.lua')
           if not file_exist(zip_file) then
             local zipcmd = 'cd '..cd_dir
                         ..' && '..cmd.zip..' '..zip_file..' '..modulename
                         .. ' -x "*/\\.*"'
             assert(execute(zipcmd, dir.null, dir.null) == 0)
             local meta_code = file_read(D(cd_dir, modulename, '__meta.lua'))
-            file_write(lua_fule, meta_code)
+            file_write(lua_file, meta_code)
+            print('ADD', modulename, upkgversion)
           end        
         end
       end
@@ -1060,6 +1134,7 @@ local function rock_finalize()
   end
 end
 
+--------------------------------------------------------------------------------
 -- TODO: Allow working with more than 1 simple non-nested directory.
 local function finalize(path)
   local meta_content = file_read(D(path, '__meta.lua'))
@@ -1112,6 +1187,7 @@ local modules_body_fmt = [[
         <tr id ="%s"><td><a href="%s">%s</a></td><td>%s</td><td>%s</td></tr>
 ]]
 
+--------------------------------------------------------------------------------
 local function update_website_luarocks_packages()
   local repo = deserialize(file_read(D(dir.package_zip, '__repo.lua')))
   local names = keys_to_array(repo)
