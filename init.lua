@@ -568,13 +568,10 @@ local function repo_from_manifest()
 end
 
 --------------------------------------------------------------------------------
-local function is_in_boundle(modules, rockname)
-  local amodules = keys_to_array(modules)
-  local name = amodules[1]
-  if #amodules == 1 and module_bundles[name] then
-    for _,p in ipairs(module_bundles[name].pattern) do
+local function is_in_boundle(modulename, rockname)
+  if module_bundles[modulename] then
+    for _,p in ipairs(module_bundles[modulename].pattern) do
       if rockname:find(p) then
-        print('BUNDLE', rockname, name)
         return true
       end
     end
@@ -582,21 +579,25 @@ local function is_in_boundle(modules, rockname)
   return false
 end
 
-local function bundle_hash(metas)
+local function bundle_hash(components)
   local hash = { }
-  for _,m in ipairs(metas) do
-    hash[#hash + 1] = m.name
-    hash[#hash + 1] = m.version
+  for _,c in pairs(components) do
+    hash[#hash + 1] = c.meta.name
+    hash[#hash + 1] = c.meta.version
   end
   return md5.sumhexa(table.concat(hash))
 end
 
-local function bundle_require(metas)
+local function bundle_require(components)
   local require = { }
-  for _,m in ipairs(metas) do
-    for name,version in pairs(m.require) do
+  for _,c in pairs(components) do
+    for name,version in pairs(c.meta.require) do
       if require[name] then
-        assert(require[name] == version) -- Simplistic approach.
+        -- Simplistic approach: same major, take highest:
+        assert(pkgu.versplit(require[name]) == pkgu.versplit(version))
+        if pkgu.verlt(require[name], version) then
+          require[name] = version
+        end
       else
         require[name] = version
       end
@@ -605,24 +606,63 @@ local function bundle_require(metas)
   return require
 end
 
-local function bundle_license(metas)
+local function bundle_license(components)
   local license = { }
-  for _,m in ipairs(metas) do
-    license[m.license] = true
+  for _,c in pairs(components) do
+    license[c.meta.license] = true
   end
   return table.concat(keys_to_array(license), ' + ')
 end
 
-local function bundle_description(metas, bundlename)
+-- TODO: More visual friendly: alphabetical order + \n:
+local function bundle_description(components, bundlename)
   local description = { }
-  for _,m in ipairs(metas) do
-    description[#description + 1] = m.name..'~'..m.version..': '..m.description
+  for _,c in pairs(components) do
+    local desc = c.meta.description:gsub(' :', '~'..c.meta.version..' :')
+    description[#description + 1] = desc
   end
   return bundlename..'-bundle: '..table.concat(description, ' + ')
 end
 
-local function bundle_copy_parhs(metas)
+local function bundle_meta(components, bundlename)
+  return { 
+    name = bundlename,
+    version = '0.'..tostring(#module_bundles[bundlename].hash),
+    require = bundle_require(components),
+    license = bundle_license(components),
+    homepage = module_bundles[bundlename].homepage,
+    description = bundle_description(components, bundlename),      
+  }
+end
 
+local function bundle_dir(bundlename, bundleversion)
+  return D(dir.luarocks_package, '__bundle', bundlename, bundleversion)
+end
+
+local function bundle_copy_paths(paths, bundlename, bundleversion)
+  for from in pairs(paths) do
+    local _,_,rockname,subpath  = from:find(dir.luarocks_package..'/([^/]+)/[^/]+/[^/]+/(.+)')
+    if subpath ~= '__meta.lua' then
+      local to = D(bundle_dir(bundlename, bundleversion), bundlename)
+      if subpath:sub(1,2) == '__' and subpath:sub(1,5) ~= '__bin' then
+        to = D(to, (subpath:gsub('^__(.-)/', '__%1/'..rockname..'/')))
+      else
+        to = D(to, subpath)
+      end
+      local content = file_read(from)
+      if file_exist(to) then
+        local existing_content = file_read(to)
+        if existing_content ~= content then
+          print('SKIPPING '..bundlename..' due to conflict in '..to)
+          return false
+        end
+      else
+        mkdir_all(to)
+        file_write(to, content)
+      end
+    end
+  end
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -750,8 +790,8 @@ local function remove_expected(unmatched)
 end
 
 local function has_module_conflict(modules, rockname, rockversion)
-  if not is_in_boundle(modules, rockname) then
-    for modulename in pairs(modules) do
+  for modulename in pairs(modules) do
+    if not is_in_boundle(modulename, rockname) then
       local in_rockname, in_rockversion = module_exist(rock_modules, modulename)
       if in_rockname and in_rockname ~= rockname then
         local save_error = id_logger(rock_error, rockname, rockversion)
@@ -891,6 +931,9 @@ local function fix_require_rocknames_to_modules(modulemeta, repo)
       local modules = assert(getvarg(rock_modules, dep_name, target_version))
       for dep_modulename in pairs(modules) do
         if dep_modulename ~= modulemeta.name then -- No bundle self-dependency.
+          if is_in_boundle(dep_modulename, dep_name) then
+            dep_version = '0' -- Simplistic approach: no versioning for bundles.
+          end
           fixed_require[dep_modulename] = dep_version
         end
       end
@@ -1050,7 +1093,6 @@ local function install(repo, rockname, rockversion, level)
       return save_pass(rockname, rockversion, false)
     end
 
-    -- TODO: Check bundle and pattern and allow if so:
     local module_conflict = has_module_conflict(modules, rockname, rockversion) 
     if module_conflict then
       print_status('FAIL', 'module conflict :'..module_conflict)
@@ -1109,26 +1151,69 @@ end
 --   31. create __boundle/rootname/incrversion and copy (handle __, collisions)
 --   32. crate aggregated __meta.lua
 --   33. zip
+
+local function pack_module(name, version, cd_dir)
+  local basename = name..'~'..version
+  local zip_file = D(dir.package_zip, basename..'.zip')
+  local lua_file = D(dir.package_zip, basename..'.lua')
+  if not file_exist(zip_file) then
+    local zipcmd = 'cd '..cd_dir
+                ..' && '..cmd.zip..' '..zip_file..' '..name
+                .. ' -x "*/\\.*"'
+    assert(execute(zipcmd, dir.null, dir.null) == 0)
+    local meta_code = file_read(D(cd_dir, name, '__meta.lua'))
+    file_write(lua_file, meta_code)
+    print('ADD', name, version)
+  end
+end
+
 local function rock_finalize()
+  local bundles = { }
   for rockname, upkgversions in pairs(rock_pass) do
     for upkgversion, os_arch_pass in pairs(upkgversions) do
+      local cd_dir = D(dir.luarocks_package, rockname, upkgversion)
       if all_os_pass(os_arch_pass) then
         local modules = modules_of_rockname(rockname, upkgversion)
-        local cd_dir = D(dir.luarocks_package, rockname, upkgversion)
         for modulename in pairs(modules) do
-          local basename = modulename..'~'..upkgversion
-          local zip_file = D(dir.package_zip, basename..'.zip')
-          local lua_file = D(dir.package_zip, basename..'.lua')
-          if not file_exist(zip_file) then
-            local zipcmd = 'cd '..cd_dir
-                        ..' && '..cmd.zip..' '..zip_file..' '..modulename
-                        .. ' -x "*/\\.*"'
-            assert(execute(zipcmd, dir.null, dir.null) == 0)
-            local meta_code = file_read(D(cd_dir, modulename, '__meta.lua'))
-            file_write(lua_file, meta_code)
-            print('ADD', modulename, upkgversion)
+          if not is_in_boundle(modulename, rockname) then
+            pack_module(modulename, upkgversion, cd_dir)
+          else -- Part of a bundle:
+            bundles[modulename] = bundles[modulename] or { }
+            local info = { 
+              version = upkgversion, 
+              dir = D(cd_dir, modulename),
+              meta = deserialize(file_read(D(cd_dir, modulename, '__meta.lua')))
+            }
+            pkgu.infoinsert(bundles[modulename], rockname, info)
           end        
+        
         end
+      end
+    end
+  end
+  -- Now prepare all bundles which have an updated component.
+  for bundlename, bundlerepo in pairs(bundles) do
+    local components = { }
+    for rockname in pairs(bundlerepo) do
+      components[rockname] = pkgu.infobest(bundlerepo, rockname)
+    end
+    local hash = bundle_hash(components)
+    local oldhashes = module_bundles[bundlename].hash
+    if hash ~= oldhashes[#oldhashes] then
+      local meta = bundle_meta(components, bundlename)
+      local paths = { }
+      for _,info in pairs(components) do
+        pathfilesattr(info.dir, paths)
+      end
+      if bundle_copy_paths(paths, meta.name, meta.version) then
+        local metacode = serialize(meta)
+        local cd_dir = bundle_dir(meta.name, meta.version)
+        local metapath = D(cd_dir, meta.name, '__meta.lua')
+        file_write(metapath, metacode)
+        pack_module(meta.name, meta.version, cd_dir)
+        -- Save hash:
+        oldhashes[#oldhashes + 1] = hash
+        write_persisted[module_bundles]()
       end
     end
   end
@@ -1366,7 +1451,11 @@ local function update_website_index()
   for i=1,10 do
     local date = tostring(packages[i][1]):sub(1, 10)
     local info = packages[i][2]
-    updates[i] = updates_body_fmt:format(date, info.homepage, info.name, info.description, info.version)
+    local description = info.description
+    if #description > 190 then
+      description = description:sub(1,187)..'...'
+    end
+    updates[i] = updates_body_fmt:format(date, info.homepage, info.name, description, info.version)
   end
   updates = table.concat(updates)
   local template = file_read(D(dir.website, 'index.template.html'))
